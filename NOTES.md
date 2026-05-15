@@ -1,0 +1,116 @@
+# Implementation Notes
+
+## What was implemented
+
+- **Java**: Read API (`GET /events/{id}`, `GET /events` with filtering and pagination)
+- **Java**: Statistics (`GET /stats/summary`)
+- **Python**: Control Plane (`GET /health`, `GET /events/{id}/status`)
+
+## What was skipped
+
+- **Java — Authentication**: JWT auth would be the natural next step; the Read and Stats endpoints are currently open. `POST /events` is also open by design per the task spec, but in production it should require authentication too — at minimum an API key or service-level token, otherwise any actor can flood the pipeline.
+- **Python — Replay** (`POST /events/{id}/replay`): not implemented.
+- **Python — Concurrent processing with ordering & graceful shutdown**: not implemented; the processor remains serial.
+
+---
+
+## Changes to the supplied baseline code
+
+### Java (`event-api`)
+
+| What changed | Why |
+|---|---|
+| `POST /events` now returns `201 Created` | `200 OK` is semantically wrong for resource creation; `201` signals that a new resource was produced and is now addressable. |
+| Removed `throws JsonProcessingException` from controller | Propagating a checked serialization exception through the HTTP layer leaks internals; it is caught locally and wrapped in an `IllegalStateException` (which the global handler turns into a 500). |
+| `spring.jpa.hibernate.ddl-auto=update` → `none` + Flyway | `ddl-auto=update` silently drops or skips columns it cannot reconcile, has no rollback story, and is not safe in multi-instance deployments. Flyway gives versioned, auditable, repeatable migrations. |
+| Credentials moved to `${ENV_VAR:default}` in `application.properties` | Hard-coded secrets in source files are a security risk. Environment-variable injection keeps secrets out of the repo and allows different values per environment without code changes. |
+| Added `spring-boot-starter-test`, Testcontainers, `spring-kafka-test` | The original `pom.xml` had zero test dependencies — the project could not be tested at all. |
+| Added `spring-boot-starter-actuator` | Provides `/actuator/health` and `/actuator/metrics` with zero extra code — standard operational baseline for any Spring Boot service. |
+| Added `spring-boot-starter-validation` | Enables Bean Validation (`@Valid`, `@NotNull`, etc.) for request parameters and bodies. |
+| Added `GlobalExceptionHandler` | Without a centralized handler, Spring returns HTML error pages or inconsistent JSON shapes on 4xx/5xx. All errors now return `{"error":"...","code":"...","timestamp":"..."}`. |
+| Added `type` column to `events` table | The Read API needs to filter by type and Statistics needs to group by type. Extracting it at write time into a dedicated indexed column avoids expensive `payload::jsonb->>'type'` expressions on every read. |
+| `db/init.sql` updated to include `type` column and new indexes | Keeps the docker-compose seed schema consistent with what Flyway produces on a clean start. |
+
+### Python (`event-processor`)
+
+| What changed | Why |
+|---|---|
+| All config constants replaced with `os.getenv(...)` | Hard-coded `localhost` addresses break in any containerised or multi-host environment. |
+| Minio object key changed from `uuid4().xml` to `{event_id}.xml` | The original code generated a random filename, permanently losing the link between a Kafka event and its Minio object. Using the event id as the key makes the object deterministically addressable, enables the `/status` endpoint, and makes re-processing idempotent (a second `put_object` with the same key overwrites the same object rather than creating a duplicate). |
+| `print(...)` replaced with `logging` | `logging` supports log levels, timestamps, and structured output; `print` does not. |
+| Added `try/except` around `process_message` | A single bad message no longer kills the consumer loop; the error is logged and the loop continues. |
+| Added `try/finally: consumer.close()` | Ensures the consumer is properly closed and offsets are flushed when the process exits. |
+
+---
+
+## Design decisions and trade-offs
+
+### `type` column vs. JSON path expression
+
+Storing `type` as a dedicated column (extracted at write time) adds a small overhead on `POST /events` but makes all downstream queries O(log n) with a B-tree index instead of a full-table JSON scan. The trade-off is that `type` is now denormalised — if the payload's `type` field changes after ingestion (it shouldn't for an immutable event log), the column would be stale. For an append-only event log this is acceptable.
+
+### Max page size: 100
+
+A page of 100 events with typical payloads (~1–2 KB each) produces a response of roughly 100–200 KB — well within a comfortable HTTP response budget. Beyond 100 the latency/payload size grows linearly with no clear benefit; clients that need bulk export should use a dedicated batch endpoint or direct DB access.
+
+### Statistics performance
+
+All aggregates in `GET /stats/summary` are computed via a single round-trip query that leverages the `idx_events_created_at` and `idx_events_type_created_at` indexes. On a table with millions of rows the 24 h and 7 day filters benefit from the `created_at` index; the `GROUP BY type` benefits from the type index. If the table grows to hundreds of millions of rows, the next step would be a pre-aggregated materialized view refreshed on a schedule.
+
+### Minio key design (Python)
+
+Using `{event_id}.xml` as the Minio object key provides:
+1. **Idempotency** — replaying an event produces the same key, so `put_object` overwrites rather than duplicates.
+2. **Addressability** — the status endpoint can check `stat_object(bucket, f"{id}.xml")` without maintaining a separate lookup table.
+3. **Debuggability** — operators can find the XML for any event id without a mapping table.
+
+The downside: if two Kafka messages carry the same event id (e.g., a replay), the second overwrites the first. This is intentional — the latest processed version wins.
+
+---
+
+## How to run and test
+
+### Start infrastructure
+
+```bash
+cd dev
+docker compose up -d
+```
+
+### Run event-api
+
+```bash
+cd services/event-api
+./mvnw spring-boot:run
+```
+
+### Run event-processor
+
+```bash
+cd services/event-processor-python
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+### Smoke test
+
+```bash
+# Create an event
+curl -X POST http://localhost:8080/events \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"user.signup","userId":"u-1","email":"alice@example.com"}'
+
+# Expect 201 Created:
+# {"id":"<uuid>","status":"RECEIVED"}
+```
+
+---
+
+## What I would change with more time
+
+- **Authentication**: add JWT bearer auth protecting `GET /events*` and `GET /stats/*`, with seeded USER/ADMIN accounts.
+- **Transactional outbox**: the current `POST /events` saves to Postgres and then publishes to Kafka in two separate operations. If the process crashes between the two, the event is in the DB but never reaches Kafka. The outbox pattern (write a pending outbox row in the same transaction, relay it to Kafka asynchronously) eliminates this race.
+- **Metrics**: expose event ingestion rate, processing lag, and Minio write latency via Micrometer/Prometheus.
+- **Python concurrent processing**: implement the per-key ordered concurrent worker pool described in the task.
+- **Distributed tracing**: propagate a correlation id (e.g., W3C `traceparent`) from the HTTP request through Kafka and into Minio object metadata.
