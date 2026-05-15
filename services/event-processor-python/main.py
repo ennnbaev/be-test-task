@@ -3,32 +3,41 @@ event-processor (Python)
 
 Consumes events from a Kafka topic, transforms each JSON payload into XML,
 and stores the result in a Minio bucket.
+
+Also starts a control-plane HTTP server (GET /health, GET /events/{id}/status)
+in a background daemon thread.
 """
 
 import json
 import logging
 import os
 import sys
+import threading
 from io import BytesIO
 
+import uvicorn
 import xmltodict
 from confluent_kafka import Consumer
 from minio import Minio
 
+import api
+import state
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-MINIO_ENDPOINT  = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT",  "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-TOPIC    = os.getenv("KAFKA_TOPIC", "events")
-BUCKET   = os.getenv("MINIO_BUCKET", "events")
+TOPIC    = os.getenv("KAFKA_TOPIC",    "events")
+BUCKET   = os.getenv("MINIO_BUCKET",   "events")
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "event-processor-group")
+API_PORT = int(os.getenv("API_PORT",   "8081"))
 
 
 def ensure_bucket(client: Minio) -> None:
@@ -40,18 +49,25 @@ def ensure_bucket(client: Minio) -> None:
 def process_message(minio_client: Minio, raw: bytes) -> None:
     data = json.loads(raw.decode("utf-8"))
 
-    # Use the event id as the Minio object key so the object is
-    # deterministically addressable and re-processing is idempotent.
     event_id = data.get("id")
     if not event_id:
         log.warning("Message has no 'id' field, skipping: %s", data)
         return
 
-    xml = xmltodict.unparse({"event": data}, pretty=True)
-    object_key = f"{event_id}.xml"
-    body = xml.encode("utf-8")
-    minio_client.put_object(BUCKET, object_key, BytesIO(body), length=len(body))
-    log.info("Stored event %s → %s", event_id, object_key)
+    state.mark_pending(event_id)
+    try:
+        xml = xmltodict.unparse({"event": data}, pretty=True)
+        object_key = f"{event_id}.xml"
+        body = xml.encode("utf-8")
+        minio_client.put_object(BUCKET, object_key, BytesIO(body), length=len(body))
+        log.info("Stored event %s → %s", event_id, object_key)
+    finally:
+        state.discard_pending(event_id)
+
+
+def start_api(minio_client: Minio) -> None:
+    api.init(minio_client, KAFKA_BOOTSTRAP)
+    uvicorn.run(api.app, host="0.0.0.0", port=API_PORT, log_level="warning")
 
 
 def main() -> None:
@@ -62,6 +78,12 @@ def main() -> None:
         secure=False,
     )
     ensure_bucket(minio_client)
+
+    api_thread = threading.Thread(
+        target=start_api, args=(minio_client,), daemon=True, name="api-server"
+    )
+    api_thread.start()
+    log.info("Control-plane API started on port %d", API_PORT)
 
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,

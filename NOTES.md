@@ -5,7 +5,7 @@
 - **Java**: Baseline fixes — Flyway, package structure, error handling, env vars (phase 0)
 - **Java**: Read API — `GET /events/{id}`, `GET /events` with filtering and pagination (phase 1)
 - **Java**: Statistics — `GET /stats/summary` with Caffeine cache (phase 2)
-- **Python**: Control Plane (`GET /health`, `GET /events/{id}/status`)
+- **Python**: Control Plane — `GET /health`, `GET /events/{id}/status` (phase 3)
 
 ## What was skipped
 
@@ -96,6 +96,31 @@ The downside: if two Kafka messages carry the same event id (e.g., a replay), th
 
 ---
 
+### Python Control Plane — status endpoint design
+
+The status endpoint resolves state in this order:
+
+1. **Check Minio** (`stat_object(bucket, "{event_id}.xml")`) — if the object exists, the event is `"processed"`. Because the object key is deterministic (`{event_id}.xml`, fixed in phase 0), this check survives processor restarts. `processedAt` is taken from the object's `last_modified` timestamp in Minio.
+2. **Check in-memory pending set** — if the event id is in the set, return `"pending"`. The set is populated by `state.mark_pending()` before writing to Minio and cleared by `state.discard_pending()` in a `finally` block.
+3. **Neither** — return `404`. The processor has never seen this event id.
+
+Trade-off: in-memory pending state is lost on restart. After a restart, a message that was mid-flight at crash time will briefly appear as `404` until it is reprocessed (at-least-once delivery). This is acceptable because:
+- The Kafka consumer uses `auto.offset.reset=earliest` so in-flight messages are retried after restart.
+- Once reprocessing completes, Minio becomes the source of truth again.
+
+An alternative would be a Redis-backed or Postgres-backed pending state, but that adds infrastructure. For this task the in-memory approach is the right trade-off.
+
+### Python Control Plane — health check
+
+`GET /health` creates a temporary `AdminClient` (confluent-kafka) per request and calls `list_topics(timeout=3)`. This verifies broker reachability, not just that the client is configured. The Minio check calls `bucket_exists()`, which requires a real round-trip. A "the process is alive" signal (just returning 200) is explicitly not enough per the task spec.
+
+### Python — threading model
+
+The FastAPI/uvicorn server runs in a daemon thread alongside the Kafka consumer loop in the main thread. They share only the `state` module, which is protected by a `threading.Lock`. This is safe because:
+- `state` operations are short critical sections (set add/discard/contains).
+- The Minio client is thread-safe for independent requests.
+- The Kafka consumer is used only from the main thread.
+
 ## How to run and test
 
 ### Start infrastructure
@@ -112,6 +137,13 @@ cd services/event-api
 ./mvnw spring-boot:run
 ```
 
+Run Java integration tests (requires Docker for Testcontainers):
+
+```bash
+cd services/event-api
+./mvnw test
+```
+
 ### Run event-processor
 
 ```bash
@@ -119,6 +151,14 @@ cd services/event-processor-python
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
+# Control-plane API starts on http://localhost:8081
+```
+
+Run Python unit tests (no Docker needed — clients are mocked):
+
+```bash
+cd services/event-processor-python
+pytest tests/ -v
 ```
 
 ### Smoke test
@@ -128,9 +168,25 @@ python main.py
 curl -X POST http://localhost:8080/events \
   -H 'Content-Type: application/json' \
   -d '{"type":"user.signup","userId":"u-1","email":"alice@example.com"}'
+# → 201 {"id":"<uuid>","status":"RECEIVED"}
 
-# Expect 201 Created:
-# {"id":"<uuid>","status":"RECEIVED"}
+# Read it back
+curl http://localhost:8080/events/<uuid>
+# → 200 {"id":"...","payload":{"type":"user.signup",...},"status":"RECEIVED","createdAt":"..."}
+
+# List with filter
+curl "http://localhost:8080/events?type=user.signup&size=5"
+
+# Stats
+curl http://localhost:8080/stats/summary
+
+# Processor health
+curl http://localhost:8081/health
+# → 200 {"status":"ok"}  or  503 {"status":"unhealthy","errors":[...]}
+
+# Processing status
+curl http://localhost:8081/events/<uuid>/status
+# → {"status":"processed","objectKey":"<uuid>.xml","processedAt":"..."}
 ```
 
 ---
