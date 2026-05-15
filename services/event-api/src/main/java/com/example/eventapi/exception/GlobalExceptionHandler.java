@@ -1,6 +1,7 @@
 package com.example.eventapi.exception;
 
 import com.example.eventapi.dto.ErrorResponse;
+import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -22,6 +23,19 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleNotFound(EventNotFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ErrorResponse.of(ex.getMessage(), "NOT_FOUND"));
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(ConstraintViolationException ex) {
+        String message = ex.getConstraintViolations().stream()
+                .map(cv -> {
+                    String path = cv.getPropertyPath().toString();
+                    String field = path.contains(".") ? path.substring(path.lastIndexOf('.') + 1) : path;
+                    return field + ": " + cv.getMessage();
+                })
+                .collect(Collectors.joining(", "));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ErrorResponse.of(message, "VALIDATION_ERROR"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

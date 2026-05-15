@@ -2,7 +2,8 @@
 
 ## What was implemented
 
-- **Java**: Read API (`GET /events/{id}`, `GET /events` with filtering and pagination)
+- **Java**: Baseline fixes — Flyway, package structure, error handling, env vars (phase 0)
+- **Java**: Read API — `GET /events/{id}`, `GET /events` with filtering and pagination (phase 1)
 - **Java**: Statistics (`GET /stats/summary`)
 - **Python**: Control Plane (`GET /health`, `GET /events/{id}/status`)
 
@@ -52,6 +53,16 @@ Storing `type` as a dedicated column (extracted at write time) adds a small over
 ### Max page size: 100
 
 A page of 100 events with typical payloads (~1–2 KB each) produces a response of roughly 100–200 KB — well within a comfortable HTTP response budget. Beyond 100 the latency/payload size grows linearly with no clear benefit; clients that need bulk export should use a dedicated batch endpoint or direct DB access.
+
+### Read API — Specification vs JPQL
+
+For `GET /events` filtering by `type`, `from`, `to` I chose Spring Data **JPA Specification** over JPQL with optional parameters. JPQL patterns like `WHERE (:type IS NULL OR e.type = :type)` confuse the query planner — it must choose an index plan before knowing whether the parameter is null, so it often defaults to a seq scan. `Specification` composes only the predicates that are actually needed, so PostgreSQL sees a clean query and can use the `idx_events_type` or `idx_events_type_created_at` index correctly.
+
+Default sort order is `createdAt DESC` — newest events first, which matches the most common consumption pattern (tail the log).
+
+### Max page size: 100
+
+100 events × ~2 KB average payload = ~200 KB response — comfortable for HTTP. Clients that need bulk export should use a batch/export endpoint or direct DB access. Exceeding 100 returns `400 VALIDATION_ERROR` via `@Max(100)` on the controller parameter and `ConstraintViolationException` handling in `GlobalExceptionHandler`.
 
 ### Statistics performance
 
