@@ -4,7 +4,7 @@
 
 - **Java**: Baseline fixes — Flyway, package structure, error handling, env vars (phase 0)
 - **Java**: Read API — `GET /events/{id}`, `GET /events` with filtering and pagination (phase 1)
-- **Java**: Statistics (`GET /stats/summary`)
+- **Java**: Statistics — `GET /stats/summary` with Caffeine cache (phase 2)
 - **Python**: Control Plane (`GET /health`, `GET /events/{id}/status`)
 
 ## What was skipped
@@ -53,6 +53,23 @@ Storing `type` as a dedicated column (extracted at write time) adds a small over
 ### Max page size: 100
 
 A page of 100 events with typical payloads (~1–2 KB each) produces a response of roughly 100–200 KB — well within a comfortable HTTP response budget. Beyond 100 the latency/payload size grows linearly with no clear benefit; clients that need bulk export should use a dedicated batch endpoint or direct DB access.
+
+### Statistics — query design and performance
+
+`GET /stats/summary` runs four queries per cache miss, each hitting a dedicated index:
+
+| Metric | Query type | Index used |
+|---|---|---|
+| `totalCount` | `COUNT(*)` | PK / index-only scan |
+| `countByType` | JPQL `GROUP BY e.type` | `idx_events_type` |
+| `last24hCount` | JPQL `COUNT WHERE createdAt >= :since` | `idx_events_created_at` |
+| `top5TypesLast7Days` | native SQL `GROUP BY … ORDER BY count DESC LIMIT 5` | `idx_events_type_created_at` |
+
+`LIMIT 5` is not part of standard JPQL, so the top-5 query uses `nativeQuery = true`. The composite index `(type, created_at)` covers both the `WHERE created_at >= :since` filter and the `GROUP BY type`, so PostgreSQL can resolve the query with an index scan and avoid a sequential read.
+
+`totalCount` is exact, not approximate (`pg_class.reltuples`). The trade-off: for tables above ~100 M rows a plain `COUNT(*)` can take seconds even with an index-only scan. At that scale, the right fix is a pre-aggregated materialized view or an event counter table maintained by triggers — not an approximation.
+
+**Caffeine cache (TTL 60 s):** `@Cacheable("stats-summary")` wraps the entire `getSummary()` call. The cache holds at most one entry (`maximumSize=1`) and expires after 60 seconds. This means stats may lag by up to one minute, which is acceptable for an aggregate dashboard. The cache is disabled in tests (`spring.cache.type=none` injected via `@DynamicPropertySource`) so each test sees live data from the DB.
 
 ### Read API — Specification vs JPQL
 

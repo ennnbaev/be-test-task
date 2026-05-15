@@ -26,6 +26,9 @@ public abstract class BaseIntegrationTest {
         registry.add("spring.datasource.url", postgres::getJdbcUrl);
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
+        // Disable Caffeine cache in tests so each test sees live DB results
+        // instead of a cached response from a previous test's data set.
+        registry.add("spring.cache.type", () -> "none");
     }
 
     // Kafka is not needed for read-path tests; mock it to avoid requiring
