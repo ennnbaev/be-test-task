@@ -1,4 +1,4 @@
-package com.example.eventapi;
+package com.example.eventapi.dto;
 
 import java.time.Instant;
 

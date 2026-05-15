@@ -1,4 +1,4 @@
-package com.example.eventapi;
+package com.example.eventapi.entity;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
