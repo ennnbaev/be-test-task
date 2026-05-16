@@ -3,10 +3,12 @@ package com.example.eventapi.controller;
 import com.example.eventapi.BaseIntegrationTest;
 import com.example.eventapi.entity.Event;
 import com.example.eventapi.repository.EventRepository;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.time.Instant;
@@ -15,6 +17,9 @@ import java.util.UUID;
 
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -27,6 +32,9 @@ class EventControllerIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private EventRepository eventRepository;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
@@ -45,6 +53,29 @@ class EventControllerIntegrationTest extends BaseIntegrationTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").isString())
                 .andExpect(jsonPath("$.status", is("RECEIVED")));
+
+        verify(kafkaTemplate).send(eq("events"), anyString(), anyString());
+    }
+
+    @Test
+    void createEvent_thenFindById_returnsConsistentData() throws Exception {
+        String body = mockMvc.perform(post("/events")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"type":"payment.processed","amount":99.99}
+                                """))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+
+        String id = objectMapper.readTree(body).get("id").asText();
+
+        mockMvc.perform(get("/events/{id}", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id", is(id)))
+                .andExpect(jsonPath("$.type", is("payment.processed")))
+                .andExpect(jsonPath("$.status", is("RECEIVED")))
+                .andExpect(jsonPath("$.payload.amount", is(99.99)))
+                .andExpect(jsonPath("$.createdAt").isString());
     }
 
     @Test

@@ -31,10 +31,11 @@ public class StatsService {
         eventRepository.countGroupedByType()
                 .forEach(p -> countByType.put(p.getType(), p.getCount()));
 
-        Instant since24h = Instant.now().minus(24, ChronoUnit.HOURS);
+        Instant now = Instant.now();
+        Instant since24h = now.minus(24, ChronoUnit.HOURS);
         long last24hCount = eventRepository.countCreatedAfter(since24h);
 
-        Instant since7d = Instant.now().minus(7, ChronoUnit.DAYS);
+        Instant since7d = now.minus(7, ChronoUnit.DAYS);
         List<TypeCount> top5 = eventRepository.top5TypesSince(since7d).stream()
                 .map(p -> new TypeCount(p.getType(), p.getCount()))
                 .toList();

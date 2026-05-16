@@ -63,7 +63,10 @@ public class EventService {
         Map<String, Object> kafkaMessage = new LinkedHashMap<>();
         kafkaMessage.put("id", id.toString());
         kafkaMessage.put("payload", body);
-        kafkaTemplate.send(TOPIC, id.toString(), toJson(kafkaMessage));
+        kafkaTemplate.send(TOPIC, id.toString(), toJson(kafkaMessage))
+                .whenComplete((result, ex) -> {
+                    if (ex != null) log.error("Failed to publish event {} to Kafka", id, ex);
+                });
 
         log.info("Event created: id={}, type={}", id, type);
         return new EventCreatedResponse(id.toString(), "RECEIVED");

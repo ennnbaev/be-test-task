@@ -36,6 +36,9 @@ def health():
     Returns 200 only when both Kafka and Minio are actually reachable.
     Returns 503 with a list of failures otherwise.
     """
+    if _minio is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
     errors: list[str] = []
 
     try:
@@ -48,7 +51,10 @@ def health():
             "bootstrap.servers": _kafka_bootstrap,
             "socket.timeout.ms": 3000,
         })
-        admin.list_topics(timeout=3)
+        try:
+            admin.list_topics(timeout=3)
+        finally:
+            del admin
     except Exception as exc:
         errors.append(f"kafka: {exc}")
 
@@ -70,6 +76,9 @@ def get_event_status(event_id: str):
       2. Check in-memory pending set     → "pending"
       3. Neither                         → 404
     """
+    if _minio is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
     try:
         obj = _minio.stat_object(_bucket, f"{event_id}.xml")
         return {

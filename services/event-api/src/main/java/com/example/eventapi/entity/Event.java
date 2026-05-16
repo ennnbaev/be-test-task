@@ -4,6 +4,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.validation.constraints.Size;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -18,13 +19,14 @@ public class Event {
     @Column(columnDefinition = "TEXT", nullable = false)
     private String payload;
 
+    @Size(max = 100)
     @Column(length = 100)
     private String type;
 
     @Column(nullable = false, length = 50)
     private String status;
 
-    @Column(name = "created_at", nullable = false)
+    @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
     public UUID getId() { return id; }
